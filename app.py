@@ -2,12 +2,19 @@ import os
 import uuid
 import io
 import random
-from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+# from pydantic import BaseModel, Field
+##########エージェントによるデータ取得検証###########
+from pydantic.v1 import BaseModel, Field
+###################################################
 from dotenv import load_dotenv
 import pandas as pd
 import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool
+from langgraph.graph import MessagesState, StateGraph, END
+from langgraph.prebuilt import ToolNode
 
 
 load_dotenv()
@@ -19,8 +26,8 @@ llm_o1 = ChatOpenAI(model="o1")
 
 problem_examples = [
     "300円で最も満足できるおやつの組み合わせは？",
-    "ナップサックに詰め込む品物の総価値を最大にするには？",
-    "5人に8つの仕事を割り当てます。熟練度やコストを考慮した割り当て方は？"
+    # "ナップサックに詰め込む品物の総価値を最大にするには？",
+    # "5人に8つの仕事を割り当てます。熟練度やコストを考慮した割り当て方は？"
 ]
 
 
@@ -188,6 +195,98 @@ class OptimModel(BaseModel):
         text = Objective.list2Text(self.objectives, depth, desc_only)
         return text
 
+##########エージェントによるデータ取得検証###########
+
+@tool
+def search_data(query: Annotated[str, "検索文字列"]) -> str:
+    """
+    マスタデータからデータを検索し、取得したデータに関する情報を文字列として返す。
+    取得に失敗したら空の文字列を返す。
+    引数として許されるのは、"おやつの値段", "ナップザックの容量", "仕事の名称"
+    """
+    if query == "おやつの値段":
+        data_info = """
+定数名: おやつの値段
+定義式: v_i \\quad (i \\in I)
+値: ,値段\nチョコ,60\nポテチ,100\nポッキー,120\nせんべい,90\nガム,30
+"""
+    elif query == "ナップザックの容量":
+        data_info = """
+定数名: ナップザックの容量
+定義式: c_i \\quad (i \\in I)
+値: ,容量\nA,30\nB,50\nC,40
+"""
+    elif query == "仕事の名称":
+        data_info = """
+定数名: 仕事の名称
+定義式: i \\in I
+値: 仕事の名称\n清掃\n加工\n研磨\n検査
+"""
+    else:
+        data_info = ""
+    return data_info
+
+
+class AgentState(MessagesState):
+    final_response: OptimModel
+
+
+# LLM定義
+tools = [search_data, OptimModel]
+model_with_response_tool = llm_4o.bind_tools(tools, tool_choice="any")
+
+
+# ノード定義
+def call_model(state: AgentState):
+    response = model_with_response_tool.invoke(state["messages"])
+    return {"messages": [response]}
+
+
+def respond(state: AgentState):
+    tool_call = state["messages"][-1].tool_calls[0]
+    response = OptimModel(**tool_call["args"])
+    tool_message = {
+        "type": "tool",
+        "content": "Here is your structured response",
+        "tool_call_id": tool_call["id"],
+    }
+    return {"final_response": response, "messages": [tool_message]}
+
+
+# 条件付きエッジ
+def should_continue(state: AgentState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if (
+        len(last_message.tool_calls) == 1
+        and last_message.tool_calls[0]["name"] == "OptimModel"
+    ):
+        return "respond"
+    else:
+        return "continue"
+
+
+# グラフ構築
+workflow = StateGraph(AgentState)
+
+workflow.add_node("agent", call_model)
+workflow.add_node("respond", respond)
+workflow.add_node("tools", ToolNode(tools))
+workflow.set_entry_point("agent")
+
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "continue": "tools",
+        "respond": "respond",
+    },
+)
+workflow.add_edge("tools", "agent")
+workflow.add_edge("respond", END)
+graph = workflow.compile()
+
+###################################################
 
 st.title("マスタ作成支援")
 
@@ -254,8 +353,13 @@ if st.button("実行"):
             ),
         ]
     )
-    chain = prompt | llm_4o.with_structured_output(OptimModel)
-    optim_model: OptimModel = chain.invoke(user_msg)
+    # chain = prompt | llm_4o.with_structured_output(OptimModel)
+    # optim_model: OptimModel = chain.invoke(user_msg)
+
+    ##########エージェントによるデータ取得検証###########
+    response = graph.invoke(input={"messages": [("human", user_msg)]}, debug=True)
+    optim_model: OptimModel = response["final_response"]
+    ###################################################
 
     st.session_state["executed"] = True
     st.session_state["optim_model"] = optim_model
